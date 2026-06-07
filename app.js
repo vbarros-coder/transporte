@@ -92,14 +92,8 @@ const DB = {
     },
 
     async request(url, options = {}) {
-        const token = Auth.getToken();
         const headers = { ...(options.headers || {}) };
-        if (token) headers.Authorization = `Bearer ${token}`;
         const r = await fetch(url, { ...options, headers });
-        if (r.status === 401) {
-            Auth.clear();
-            throw new Error('UNAUTHORIZED');
-        }
         if (!r.ok) {
             let msg = 'Erro';
             try { msg = (await r.json())?.error || msg; } catch {}
@@ -143,7 +137,7 @@ const DB = {
             return true;
         } catch (e) {
             console.error(`Error saving ${key}:`, e);
-            if (String(e?.message || '') === 'UNAUTHORIZED') UI.navigate('login'); else UI.toast('Erro ao salvar no banco de dados', 'error');
+            UI.toast('Erro ao salvar no banco de dados', 'error');
             return false;
         }
     },
@@ -155,7 +149,7 @@ const DB = {
             return true;
         } catch (e) {
             console.error(`Error deleting ${key}:`, e);
-            if (String(e?.message || '') === 'UNAUTHORIZED') UI.navigate('login'); else UI.toast('Erro ao excluir do banco de dados', 'error');
+            UI.toast('Erro ao excluir do banco de dados', 'error');
             return false;
         }
     }
@@ -261,38 +255,23 @@ const UI = {
     async init() {
         this.updateDate();
         this.setupEventListeners();
-        let user = null;
-        try {
-            user = await Auth.me();
-        } catch (e) {
-            user = null;
-        }
-        if (!user) {
-            this.navigate('login');
-            return;
-        }
         const backupBtn = document.getElementById('backup-btn');
         const navAdmin = document.getElementById('nav-admin');
         if (backupBtn) {
-            if (user.role !== 'admin') backupBtn.classList.add('hidden');
             backupBtn.addEventListener('click', () => {
                 window.location.href = `${API_URL}/backup`;
             });
         }
         if (navAdmin) {
-            if (user.role !== 'admin') navAdmin.classList.add('hidden'); else navAdmin.classList.remove('hidden');
+            navAdmin.classList.remove('hidden');
         }
         try {
             await DB.init();
         } catch (e) {
-            if (String(e?.message || '') === 'UNAUTHORIZED') {
-                this.navigate('login');
-                return;
-            }
             UI.toast('Erro ao conectar com o servidor', 'error');
         }
         const hash = window.location.hash.replace('#', '');
-        this.navigate(hash || 'dashboard');
+        this.navigate(hash && hash !== 'login' ? hash : 'dashboard');
     },
 
     updateDate() {
