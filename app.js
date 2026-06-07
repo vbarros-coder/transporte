@@ -6,7 +6,9 @@
  */
 
 // --- CONFIGURATION & CONSTANTS ---
-const API_URL = 'http://localhost:3001/api';
+const API_URL = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
+    ? 'http://localhost:3001/api'
+    : '/api';
 const ENTITIES = {
     VEHICLES: 'vehicles',
     DRIVERS: 'drivers',
@@ -2015,5 +2017,4 @@ window.seedDatabase = async () => {
         window.location.href = 'seed.html'; 
     } 
 };
-document.addEventListener('DOMContentLoaded', () => UI.init());
-function navigate(p) { UI.navigate(p); }
+d

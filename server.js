@@ -4,6 +4,7 @@ const sqlite3 = require('sqlite3');
 const { open } = require('sqlite');
 const path = require('path');
 const crypto = require('crypto');
+const fs = require('fs');
 
 const app = express();
 app.use(cors());
@@ -90,8 +91,18 @@ async function auditLog(userId, action, entity, entityId, payload) {
 }
 
 (async () => {
+    // No Vercel o filesystem é read-only; copia o DB para /tmp na primeira execução
+    let dbPath = path.join(__dirname, 'database.sqlite');
+    if (process.env.VERCEL) {
+        const tmpPath = '/tmp/database.sqlite';
+        if (!fs.existsSync(tmpPath) && fs.existsSync(dbPath)) {
+            fs.copyFileSync(dbPath, tmpPath);
+        }
+        dbPath = tmpPath;
+    }
+
     db = await open({
-        filename: path.join(__dirname, 'database.sqlite'),
+        filename: dbPath,
         driver: sqlite3.Database
     });
 
@@ -505,16 +516,4 @@ app.post('/api/seed', async (req, res) => {
             }
         }
     }
-    res.send({ success: true });
-});
-
-// Backup endpoint
-app.get('/api/backup', async (req, res) => {
-    const dbPath = path.join(__dirname, 'database.sqlite');
-    res.download(dbPath, `backup_${new Date().toISOString().slice(0,10)}.sqlite`);
-});
-
-const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => {
-    console.log(`Server running at http://localhost:${PORT}`);
-});
+    res.sen
