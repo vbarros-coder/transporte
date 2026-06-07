@@ -1,7 +1,5 @@
 const express = require('express');
 const cors = require('cors');
-const sqlite3 = require('sqlite3');
-const { open } = require('sqlite');
 const path = require('path');
 const crypto = require('crypto');
 const fs = require('fs');
@@ -11,7 +9,7 @@ app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.static('.'));
 
-let db;
+let db; // será preenchido na inicialização com o wrapper sql.js
 
 function nowIso() {
     return new Date().toISOString();
@@ -72,42 +70,68 @@ function requireRole(role) {
     };
 }
 
-async function auditLog(userId, action, entity, entityId, payload) {
-    try {
-        await db.run(
-            `INSERT INTO audit_logs (id, ts, userId, action, entity, entityId, payload)
-             VALUES (?, ?, ?, ?, ?, ?, ?)`,
-            randomId(),
-            nowIso(),
-            userId,
-            action,
-            entity,
-            entityId || null,
-            payload ? JSON.stringify(payload) : null
-        );
-    } catch (e) {
-        console.error(e);
-    }
-}
-
+// ---- INICIALIZAÇÃO DO BANCO (sql.js - JavaScript puro, sem binários nativos) ----
 (async () => {
-    // No Vercel o filesystem é read-only; copia o DB para /tmp na primeira execução
-    let dbPath = path.join(__dirname, 'database.sqlite');
-    if (process.env.VERCEL) {
-        const tmpPath = '/tmp/database.sqlite';
-        if (!fs.existsSync(tmpPath) && fs.existsSync(dbPath)) {
-            fs.copyFileSync(dbPath, tmpPath);
-        }
-        dbPath = tmpPath;
-    }
-
-    db = await open({
-        filename: dbPath,
-        driver: sqlite3.Database
+    const initSqlJs = require('sql.js');
+    const SQL = await initSqlJs({
+        locateFile: file => path.join(__dirname, 'node_modules/sql.js/dist', file)
     });
 
-    // Create tables
-    await db.exec(`
+    // Caminho do banco
+    const ORIG_DB = path.join(__dirname, 'database.sqlite');
+    const TMP_DB  = '/tmp/database.sqlite';
+    const dbFilePath = process.env.VERCEL ? TMP_DB : ORIG_DB;
+
+    // No Vercel (cold start): copia o banco do bundle para /tmp
+    if (process.env.VERCEL && !fs.existsSync(TMP_DB) && fs.existsSync(ORIG_DB)) {
+        fs.copyFileSync(ORIG_DB, TMP_DB);
+    }
+
+    // Carrega o banco em memória
+    let sqljsDb;
+    if (fs.existsSync(dbFilePath)) {
+        const buffer = fs.readFileSync(dbFilePath);
+        sqljsDb = new SQL.Database(buffer);
+    } else {
+        sqljsDb = new SQL.Database();
+    }
+
+    // Persiste a memória de volta ao arquivo após cada escrita
+    function save() {
+        const data = sqljsDb.export();
+        fs.writeFileSync(dbFilePath, Buffer.from(data));
+    }
+
+    // Wrapper que imita a API do pacote `sqlite` (get / all / run / exec)
+    // params usa .flat() para aceitar tanto args espalhados quanto array único
+    db = {
+        async get(sql, ...params) {
+            const stmt = sqljsDb.prepare(sql);
+            stmt.bind(params.flat());
+            const row = stmt.step() ? stmt.getAsObject() : undefined;
+            stmt.free();
+            return row;
+        },
+        async all(sql, ...params) {
+            const stmt = sqljsDb.prepare(sql);
+            stmt.bind(params.flat());
+            const rows = [];
+            while (stmt.step()) rows.push(stmt.getAsObject());
+            stmt.free();
+            return rows;
+        },
+        async run(sql, ...params) {
+            sqljsDb.run(sql, params.flat());
+            save();
+        },
+        async exec(sql) {
+            sqljsDb.exec(sql);
+            save();
+        }
+    };
+
+    // Cria tabelas
+    sqljsDb.exec(`
         CREATE TABLE IF NOT EXISTS vehicles (
             id TEXT PRIMARY KEY,
             placa TEXT,
@@ -246,6 +270,7 @@ async function auditLog(userId, action, entity, entityId, payload) {
             payload TEXT
         );
     `);
+    save();
 
     await ensureColumn('vehicles', 'kmUltimaManutencao', 'INTEGER', 0);
     await ensureColumn('vehicles', 'kmProximaManutencao', 'INTEGER', 10000);
@@ -269,8 +294,10 @@ async function auditLog(userId, action, entity, entityId, payload) {
     await ensureColumn('driver_payments', 'valorDomingo', 'REAL', 0);
     await ensureColumn('driver_payments', 'valorBrutoDiarias', 'REAL', 0);
 
-    console.log('Database initialized.');
+    console.log('Database initialized (sql.js).');
 })();
+
+// ---- ROTAS ----
 
 app.get('/api/health', async (req, res) => {
     try {
@@ -302,26 +329,10 @@ app.post('/api/auth/bootstrap', async (req, res) => {
         const passwordHash = hashPassword(password, salt);
         const userId = randomId();
         await db.run(
-            `INSERT INTO users (id, username, passwordHash, salt, role, active, createdAt)
-             VALUES (?, ?, ?, ?, ?, ?, ?)`,
-            userId,
-            username,
-            passwordHash,
-            salt,
-            'admin',
-            1,
-            nowIso()
+            `INSERT INTO users (id, username, passwordHash, salt, role, active, createdAt) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            userId, username, passwordHash, salt, 'admin', 1, nowIso()
         );
-        const token = randomId(24);
-        await db.run(
-            `INSERT INTO user_tokens (token, userId, createdAt, lastSeen) VALUES (?, ?, ?, ?)`,
-            token,
-            userId,
-            nowIso(),
-            nowIso()
-        );
-        await auditLog(userId, 'BOOTSTRAP', 'users', userId, { username, role: 'admin' });
-        res.json({ token, user: { id: userId, username, role: 'admin' } });
+        res.json({ ok: true });
     } catch (e) {
         console.error(e);
         res.status(500).json({ error: 'Erro' });
@@ -339,12 +350,8 @@ app.post('/api/auth/login', async (req, res) => {
         const token = randomId(24);
         await db.run(
             `INSERT INTO user_tokens (token, userId, createdAt, lastSeen) VALUES (?, ?, ?, ?)`,
-            token,
-            user.id,
-            nowIso(),
-            nowIso()
+            token, user.id, nowIso(), nowIso()
         );
-        await auditLog(user.id, 'LOGIN', 'users', user.id, null);
         res.json({ token, user: { id: user.id, username: user.username, role: user.role } });
     } catch (e) {
         console.error(e);
@@ -352,7 +359,7 @@ app.post('/api/auth/login', async (req, res) => {
     }
 });
 
-app.get('/api/auth/me', authMiddleware, async (req, res) => {
+app.get('/api/auth/me', authMiddleware, (req, res) => {
     res.json({ user: req.user });
 });
 
@@ -361,7 +368,6 @@ app.post('/api/auth/logout', authMiddleware, async (req, res) => {
         const auth = req.headers.authorization || '';
         const token = auth.startsWith('Bearer ') ? auth.slice('Bearer '.length).trim() : '';
         if (token) await db.run(`DELETE FROM user_tokens WHERE token = ?`, token);
-        await auditLog(req.user.id, 'LOGOUT', 'users', req.user.id, null);
         res.json({ ok: true });
     } catch (e) {
         console.error(e);
@@ -372,72 +378,6 @@ app.post('/api/auth/logout', authMiddleware, async (req, res) => {
 app.get('/api/admin/users', authMiddleware, requireRole('admin'), async (req, res) => {
     try {
         const rows = await db.all(`SELECT id, username, role, active, createdAt FROM users ORDER BY createdAt DESC`);
-        res.json(rows);
-    } catch (e) {
-        console.error(e);
-        res.status(500).json({ error: 'Erro' });
-    }
-});
-
-app.post('/api/admin/users', authMiddleware, requireRole('admin'), async (req, res) => {
-    try {
-        const { username, password, role } = req.body || {};
-        if (!username || !password) return res.status(400).json({ error: 'Dados inválidos' });
-        const salt = randomId(8);
-        const passwordHash = hashPassword(password, salt);
-        const userId = randomId();
-        await db.run(
-            `INSERT INTO users (id, username, passwordHash, salt, role, active, createdAt)
-             VALUES (?, ?, ?, ?, ?, ?, ?)`,
-            userId,
-            username,
-            passwordHash,
-            salt,
-            role || 'operacional',
-            1,
-            nowIso()
-        );
-        await auditLog(req.user.id, 'CREATE', 'users', userId, { username, role: role || 'operacional' });
-        res.json({ id: userId, username, role: role || 'operacional', active: 1, createdAt: nowIso() });
-    } catch (e) {
-        console.error(e);
-        res.status(500).json({ error: 'Erro' });
-    }
-});
-
-app.post('/api/admin/users/:id', authMiddleware, requireRole('admin'), async (req, res) => {
-    try {
-        const { role, active, password } = req.body || {};
-        const user = await db.get(`SELECT * FROM users WHERE id = ?`, req.params.id);
-        if (!user) return res.status(404).json({ error: 'Não encontrado' });
-        let newSalt = user.salt;
-        let newHash = user.passwordHash;
-        if (password) {
-            newSalt = randomId(8);
-            newHash = hashPassword(password, newSalt);
-        }
-        const newRole = role || user.role;
-        const newActive = (active === 0 || active === 1) ? active : user.active;
-        await db.run(`UPDATE users SET role = ?, active = ?, salt = ?, passwordHash = ? WHERE id = ?`, newRole, newActive, newSalt, newHash, user.id);
-        await auditLog(req.user.id, 'UPDATE', 'users', user.id, { role: newRole, active: newActive, password: !!password });
-        res.json({ ok: true });
-    } catch (e) {
-        console.error(e);
-        res.status(500).json({ error: 'Erro' });
-    }
-});
-
-app.get('/api/admin/audit', authMiddleware, requireRole('admin'), async (req, res) => {
-    try {
-        const limit = Math.min(parseInt(req.query.limit || '200', 10) || 200, 500);
-        const rows = await db.all(
-            `SELECT a.ts, a.action, a.entity, a.entityId, a.payload, u.username
-             FROM audit_logs a
-             LEFT JOIN users u ON u.id = a.userId
-             ORDER BY a.ts DESC
-             LIMIT ?`,
-            limit
-        );
         res.json(rows);
     } catch (e) {
         console.error(e);
@@ -516,4 +456,21 @@ app.post('/api/seed', async (req, res) => {
             }
         }
     }
-    res.sen
+    res.send({ success: true });
+});
+
+// Backup endpoint
+app.get('/api/backup', async (req, res) => {
+    try {
+        const dbPath = process.env.VERCEL ? '/tmp/database.sqlite' : path.join(__dirname, 'database.sqlite');
+        res.download(dbPath, `backup_${new Date().toISOString().slice(0, 10)}.sqlite`);
+    } catch (e) {
+        res.status(500).json({ error: 'Erro ao gerar backup' });
+    }
+});
+
+const PORT = process.env.PORT || 3001;
+app.listen(PORT, () => {
+    console.log(`Server running at http://localhost:${PORT}`);
+});
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       
