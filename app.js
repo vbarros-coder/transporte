@@ -6,9 +6,6 @@
  */
 
 // --- CONFIGURATION & CONSTANTS ---
-const API_URL = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
-    ? 'http://localhost:3001/api'
-    : '/api';
 const ENTITIES = {
     VEHICLES: 'vehicles',
     DRIVERS: 'drivers',
@@ -23,92 +20,32 @@ const ENTITIES = {
     MAINTENANCE_LOGS: 'maintenance_logs'
 };
 
-const Auth = {
-    tokenKey: 'tm_token',
-    userKey: 'tm_user',
-    getToken() {
-        return localStorage.getItem(this.tokenKey) || '';
-    },
-    setSession(token, user) {
-        localStorage.setItem(this.tokenKey, token);
-        localStorage.setItem(this.userKey, JSON.stringify(user || null));
-    },
-    clear() {
-        localStorage.removeItem(this.tokenKey);
-        localStorage.removeItem(this.userKey);
-    },
-    getUser() {
-        try { return JSON.parse(localStorage.getItem(this.userKey) || 'null'); } catch { return null; }
-    },
-    async status() {
-        const r = await fetch(`${API_URL.replace('/api','')}/api/auth/status`);
-        return await r.json();
-    },
-    async me() {
-        const token = this.getToken();
-        if (!token) return null;
-        const r = await fetch(`${API_URL.replace('/api','')}/api/auth/me`, { headers: { Authorization: `Bearer ${token}` } });
-        if (!r.ok) return null;
-        const data = await r.json();
-        this.setSession(token, data.user);
-        return data.user;
-    },
-    async login(username, password) {
-        const r = await fetch(`${API_URL.replace('/api','')}/api/auth/login`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ username, password })
-        });
-        const data = await r.json();
-        if (!r.ok) throw new Error(data?.error || 'Erro');
-        this.setSession(data.token, data.user);
-        return data.user;
-    },
-    async bootstrap(username, password) {
-        const r = await fetch(`${API_URL.replace('/api','')}/api/auth/bootstrap`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ username, password })
-        });
-        const data = await r.json();
-        if (!r.ok) throw new Error(data?.error || 'Erro');
-        this.setSession(data.token, data.user);
-        return data.user;
-    },
-    async logout() {
-        const token = this.getToken();
-        if (token) {
-            await fetch(`${API_URL.replace('/api','')}/api/auth/logout`, { method: 'POST', headers: { Authorization: `Bearer ${token}` } });
-        }
-        this.clear();
-    }
-};
+// Auth stub (sem login ativo)
+const Auth = { getToken: () => '', clear: () => {}, getUser: () => null };
 
-// --- DATABASE OBJECT (DB) ---
+// --- DATABASE OBJECT (DB) — localStorage ---
 const DB = {
     cache: {},
 
-    async init() {
-        // No more localStorage migration - use SQLite exclusively
-        await this.refreshAll();
+    _lsKey(key) { return `tm_${key}`; },
+
+    _load(key) {
+        try { return JSON.parse(localStorage.getItem(this._lsKey(key)) || '[]'); }
+        catch { return []; }
     },
 
-    async request(url, options = {}) {
-        const headers = { ...(options.headers || {}) };
-        const r = await fetch(url, { ...options, headers });
-        if (!r.ok) {
-            let msg = 'Erro';
-            try { msg = (await r.json())?.error || msg; } catch {}
-            throw new Error(msg);
+    _persist(key, data) {
+        localStorage.setItem(this._lsKey(key), JSON.stringify(data));
+    },
+
+    async init() {
+        for (const key of Object.values(ENTITIES)) {
+            this.cache[key] = this._load(key);
         }
-        return r;
     },
 
     async refreshAll() {
-        for (const key of Object.values(ENTITIES)) {
-            const response = await this.request(`${API_URL}/${key}`);
-            this.cache[key] = await response.json();
-        }
+        await this.init();
     },
 
     getAll(key) {
@@ -121,37 +58,28 @@ const DB = {
 
     async save(key, item) {
         try {
-            const response = await this.request(`${API_URL}/${key}`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(item)
-            });
-            const savedItem = await response.json();
-            
-            // Update cache
+            if (!item.id) item.id = Math.random().toString(36).substr(2, 9);
             const data = this.cache[key] || [];
-            const index = data.findIndex(i => i.id === savedItem.id);
-            if (index !== -1) {
-                data[index] = savedItem;
-            } else {
-                data.push(savedItem);
-            }
+            const index = data.findIndex(i => i.id === item.id);
+            if (index !== -1) { data[index] = item; } else { data.push(item); }
+            this.cache[key] = data;
+            this._persist(key, data);
             return true;
         } catch (e) {
             console.error(`Error saving ${key}:`, e);
-            UI.toast('Erro ao salvar no banco de dados', 'error');
+            UI.toast('Erro ao salvar', 'error');
             return false;
         }
     },
 
     async delete(key, id) {
         try {
-            await this.request(`${API_URL}/${key}/${id}`, { method: 'DELETE' });
-            this.cache[key] = this.cache[key].filter(item => item.id !== id);
+            this.cache[key] = (this.cache[key] || []).filter(item => item.id !== id);
+            this._persist(key, this.cache[key]);
             return true;
         } catch (e) {
             console.error(`Error deleting ${key}:`, e);
-            UI.toast('Erro ao excluir do banco de dados', 'error');
+            UI.toast('Erro ao excluir', 'error');
             return false;
         }
     }
@@ -261,7 +189,13 @@ const UI = {
         const navAdmin = document.getElementById('nav-admin');
         if (backupBtn) {
             backupBtn.addEventListener('click', () => {
-                window.location.href = `${API_URL}/backup`;
+                const backup = {};
+                for (const key of Object.values(ENTITIES)) backup[key] = DB.getAll(key);
+                const blob = new Blob([JSON.stringify(backup, null, 2)], { type: 'application/json' });
+                const a = document.createElement('a');
+                a.href = URL.createObjectURL(blob);
+                a.download = `backup_${new Date().toISOString().slice(0,10)}.json`;
+                a.click();
             });
         }
         if (navAdmin) {
@@ -480,9 +414,8 @@ const Pages = {
             this.render();
         },
         async api(path, options) {
-            const base = API_URL.replace('/api', '');
-            const r = await DB.request(`${base}${path}`, options);
-            return await r.json();
+            // Modo localStorage — sem servidor
+            return {};
         },
         renderUsers() {
             const body = document.getElementById('admin-body');
@@ -633,15 +566,7 @@ const Pages = {
         },
         async loadHealth() {
             const el = document.getElementById('admin-health');
-            if (!el) return;
-            try {
-                const base = API_URL.replace('/api', '');
-                const r = await fetch(`${base}/api/health`);
-                const data = await r.json();
-                el.innerHTML = data.ok ? `<span class="text-emerald-600 font-bold">OK</span> • ${new Date(data.time).toLocaleString()}` : `<span class="text-rose-600 font-bold">Erro</span>`;
-            } catch (e) {
-                el.innerHTML = `<span class="text-rose-600 font-bold">Erro</span>`;
-            }
+            if (el) el.innerHTML = `<span class="text-emerald-600 font-bold">OK</span> • Modo localStorage (offline)`;
         }
     },
     dashboard: {
@@ -2017,4 +1942,6 @@ window.seedDatabase = async () => {
         window.location.href = 'seed.html'; 
     } 
 };
-d
+document.addEventListener('DOMContentLoaded', () => UI.init());
+function navigate(p) { UI.navigate(p); }
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               
